@@ -11,40 +11,59 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 )
 
-type countingWriter struct {
-	n *int64
-}
-
-func (w countingWriter) Write(p []byte) (int, error) {
-	*w.n += int64(len(p))
-	return len(p), nil
-}
-
-func cacheAndHash(file model.FileStreamer, up driver.UpdateProgress) (model.File, int64, string, string, error) {
-	h1 := sha1.New()
-	h256 := sha256.New()
-	size := file.GetSize()
-	var counted int64
-	ws := []io.Writer{h1, h256}
-	if size <= 0 {
-		ws = append(ws, countingWriter{n: &counted})
-	}
-	p := up
-	f, err := file.CacheFullAndWriter(&p, io.MultiWriter(ws...))
+// cacheAndHash stages the upload on disk while computing the hashes required
+// by WPS. HybridCache may keep an entire upload in memory, so use a dedicated
+// temporary file regardless of the global memory-cache settings.
+// The caller owns the returned file and must close and remove it.
+func cacheAndHash(ctx context.Context, file model.FileStreamer) (*os.File, int64, string, string, error) {
+	f, err := os.CreateTemp(conf.Conf.TempDir, "wps-upload-*")
 	if err != nil {
 		return nil, 0, "", "", err
 	}
-	if size <= 0 {
-		size = counted
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+		}
+	}()
+
+	reader := io.Reader(file)
+	if cached := file.GetFile(); cached != nil {
+		if _, err := cached.Seek(0, io.SeekStart); err != nil {
+			return nil, 0, "", "", err
+		}
+		reader = cached
 	}
+
+	h1 := sha1.New()
+	h256 := sha256.New()
+	size, err := io.Copy(io.MultiWriter(f, h1, h256), &stream.ReaderWithCtx{
+		Reader: reader,
+		Ctx:    ctx,
+	})
+	if err != nil {
+		return nil, 0, "", "", err
+	}
+	if expected := file.GetSize(); expected > 0 && expected != size {
+		return nil, 0, "", "", fmt.Errorf("upload size mismatch: expected %d bytes, got %d", expected, size)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, 0, "", "", err
+	}
+
+	cleanup = false
 	return f, size, hex.EncodeToString(h1.Sum(nil)), hex.EncodeToString(h256.Sum(nil)), nil
 }
 
@@ -124,13 +143,14 @@ func (d *Wps) put(ctx context.Context, dstDir model.Obj, file model.FileStreamer
 	if node.HasFile && node.Kind == "folder" {
 		parentID = node.FileID
 	}
-	f, size, sha1Hex, sha256Hex, err := cacheAndHash(file, func(float64) {})
+	f, size, sha1Hex, sha256Hex, err := cacheAndHash(ctx, file)
 	if err != nil {
 		return err
 	}
-	if c, ok := f.(io.Closer); ok {
-		defer c.Close()
-	}
+	defer func() {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}()
 
 	// 在隐藏文件名前加_上传，这是WPS的限制，无法上传隐藏文件，也无法将任何文件重命名为隐藏文件，所有隐藏文件会被自动加上_ 上传
 	// 甚至可以上传前缀是..的文件，但是单个点就是不行
